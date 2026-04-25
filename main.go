@@ -20,6 +20,13 @@ import (
 const configFileName = "sync.yaml"
 const logFileName = "sync.log"
 
+// maxBodySize limits HTTP response bodies to prevent memory exhaustion.
+// Checksum files are small; downloaded files may be larger.
+const (
+	maxChecksumBodySize  = 4 << 10   // 4 KB
+	maxDownloadBodySize  = 500 << 20 // 500 MB
+)
+
 type Config struct {
 	TimeoutSeconds int          `yaml:"timeout_seconds"`
 	UserAgent      string       `yaml:"user_agent"`
@@ -85,9 +92,11 @@ func run() error {
 		logFile: logFile,
 	}
 
+	ctx := context.Background()
+
 	var failed bool
 	for _, file := range cfg.Files {
-		if err := r.syncFile(file, userAgent); err != nil {
+		if err := r.syncFile(ctx, file, userAgent); err != nil {
 			failed = true
 			r.logf("ERROR %s: %v", file.Path, err)
 			fmt.Fprintf(os.Stderr, "- %s: %v\n", file.Path, err)
@@ -140,14 +149,14 @@ func loadConfig(path string) (Config, error) {
 	return cfg, nil
 }
 
-func (r runner) syncFile(file FileConfig, userAgent string) error {
+func (r runner) syncFile(ctx context.Context, file FileConfig, userAgent string) error {
 	targetPath, err := resolveTargetPath(r.rootDir, file.Path)
 	if err != nil {
 		return err
 	}
 
 	checksumURL := file.URL + ".sha256"
-	expectedHash, err := r.fetchExpectedHash(file, checksumURL, userAgent)
+	expectedHash, err := r.fetchExpectedHash(ctx, checksumURL, userAgent)
 	if err != nil {
 		return err
 	}
@@ -167,7 +176,7 @@ func (r runner) syncFile(file FileConfig, userAgent string) error {
 		state = "downloaded"
 	}
 
-	if err := r.downloadVerifiedFile(targetPath, file.URL, expectedHash, userAgent); err != nil {
+	if err := r.downloadVerifiedFile(ctx, targetPath, file.URL, expectedHash, userAgent); err != nil {
 		return err
 	}
 
@@ -196,29 +205,31 @@ func resolveTargetPath(rootDir, relPath string) (string, error) {
 	return fullPath, nil
 }
 
-func (r runner) fetchExpectedHash(file FileConfig, checksumURL, userAgent string) (string, error) {
-	body, err := r.get(checksumURL, userAgent)
+func (r runner) fetchExpectedHash(ctx context.Context, checksumURL, userAgent string) (string, error) {
+	body, err := r.get(ctx, checksumURL, userAgent)
 	if err != nil {
 		return "", fmt.Errorf("fetch checksum: %w", err)
 	}
 
-	hash, err := parseChecksum(body, file.Path, file.URL)
+	hash, err := parseChecksum(body)
 	if err != nil {
 		return "", err
 	}
 	return hash, nil
 }
 
-func parseChecksum(data []byte, configuredPath, fileURL string) (string, error) {
-	hash := strings.ToLower(strings.TrimSpace(string(data)))
-	if hash == "" {
+func parseChecksum(data []byte) (string, error) {
+	text := strings.TrimSpace(string(data))
+	if text == "" {
 		return "", errors.New("checksum file is empty")
 	}
+	// Support standard sha256sum format: "<hash>  <filename>" or "<hash> *<filename>"
+	hash := strings.ToLower(strings.Fields(text)[0])
 	if len(hash) != sha256.Size*2 {
-		return "", fmt.Errorf("invalid sha256 value %q", strings.TrimSpace(string(data)))
+		return "", fmt.Errorf("invalid sha256 value %q", hash)
 	}
 	if _, err := hex.DecodeString(hash); err != nil {
-		return "", fmt.Errorf("invalid sha256 value %q", strings.TrimSpace(string(data)))
+		return "", fmt.Errorf("invalid sha256 value %q", hash)
 	}
 	return hash, nil
 }
@@ -249,17 +260,8 @@ func executableDir() (string, error) {
 	return filepath.Dir(execPath), nil
 }
 
-func (r runner) downloadVerifiedFile(targetPath, fileURL, expectedHash, userAgent string) error {
-	ctx := context.Background()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, fileURL, nil)
-	if err != nil {
-		return fmt.Errorf("build download request: %w", err)
-	}
-	if userAgent != "" {
-		req.Header.Set("User-Agent", userAgent)
-	}
-
-	resp, err := r.client.Do(req)
+func (r runner) downloadVerifiedFile(ctx context.Context, targetPath, fileURL, expectedHash, userAgent string) error {
+	resp, err := r.retryGet(ctx, fileURL, userAgent)
 	if err != nil {
 		return fmt.Errorf("download file: %w", err)
 	}
@@ -282,7 +284,7 @@ func (r runner) downloadVerifiedFile(targetPath, fileURL, expectedHash, userAgen
 
 	h := sha256.New()
 	writer := io.MultiWriter(tempFile, h)
-	if _, err := io.Copy(writer, resp.Body); err != nil {
+	if _, err := io.Copy(writer, io.LimitReader(resp.Body, maxDownloadBodySize)); err != nil {
 		tempFile.Close()
 		return fmt.Errorf("write temp file: %w", err)
 	}
@@ -301,17 +303,8 @@ func (r runner) downloadVerifiedFile(targetPath, fileURL, expectedHash, userAgen
 	return nil
 }
 
-func (r runner) get(rawURL, userAgent string) ([]byte, error) {
-	ctx := context.Background()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
-	if err != nil {
-		return nil, fmt.Errorf("build request: %w", err)
-	}
-	if userAgent != "" {
-		req.Header.Set("User-Agent", userAgent)
-	}
-
-	resp, err := r.client.Do(req)
+func (r runner) get(ctx context.Context, rawURL, userAgent string) ([]byte, error) {
+	resp, err := r.retryGet(ctx, rawURL, userAgent)
 	if err != nil {
 		return nil, err
 	}
@@ -321,11 +314,43 @@ func (r runner) get(rawURL, userAgent string) ([]byte, error) {
 		return nil, fmt.Errorf("unexpected status %s", resp.Status)
 	}
 
-	body, err := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxChecksumBodySize))
 	if err != nil {
 		return nil, fmt.Errorf("read response body: %w", err)
 	}
 	return body, nil
+}
+
+func (r runner) retryGet(ctx context.Context, rawURL, userAgent string) (*http.Response, error) {
+	const maxRetries = 3
+	var lastErr error
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		if attempt > 0 {
+			time.Sleep(time.Duration(1<<uint(attempt-1)) * time.Second)
+			r.logf("RETRY %s (attempt %d/%d): %v", rawURL, attempt+1, maxRetries, lastErr)
+		}
+
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
+		if err != nil {
+			return nil, err
+		}
+		if userAgent != "" {
+			req.Header.Set("User-Agent", userAgent)
+		}
+
+		resp, err := r.client.Do(req)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		if resp.StatusCode >= 500 {
+			resp.Body.Close()
+			lastErr = fmt.Errorf("server error %s", resp.Status)
+			continue
+		}
+		return resp, nil
+	}
+	return nil, fmt.Errorf("request failed after %d attempts: %w", maxRetries, lastErr)
 }
 
 func (r runner) logf(format string, args ...any) {

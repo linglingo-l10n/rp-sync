@@ -1,8 +1,10 @@
 package main
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"io/fs"
 	"net/http"
 	"net/http/httptest"
@@ -31,7 +33,7 @@ func TestResolveTargetPath(t *testing.T) {
 func TestParseChecksum(t *testing.T) {
 	hashText := strings.Repeat("a", 64)
 
-	hash, err := parseChecksum([]byte(hashText+"\n"), "nested/file-b.txt", "https://example.com/file-b.txt")
+	hash, err := parseChecksum([]byte(hashText + "\n"))
 	if err != nil {
 		t.Fatalf("parseChecksum returned error: %v", err)
 	}
@@ -41,7 +43,7 @@ func TestParseChecksum(t *testing.T) {
 }
 
 func TestParseChecksumInvalid(t *testing.T) {
-	_, err := parseChecksum([]byte("not-a-hash file.txt\n"), "file.txt", "https://example.com/file.txt")
+	_, err := parseChecksum([]byte("not-a-hash file.txt\n"))
 	if err == nil {
 		t.Fatal("expected invalid checksum to fail")
 	}
@@ -92,7 +94,7 @@ func TestRunnerSyncFile(t *testing.T) {
 		URL:  server.URL + "/artifact.txt",
 	}
 
-	if err := r.syncFile(file, "test-agent"); err != nil {
+	if err := r.syncFile(context.Background(), file, "test-agent"); err != nil {
 		t.Fatalf("first syncFile returned error: %v", err)
 	}
 
@@ -109,7 +111,7 @@ func TestRunnerSyncFile(t *testing.T) {
 		t.Fatalf("WriteFile returned error: %v", err)
 	}
 
-	if err := r.syncFile(file, "test-agent"); err != nil {
+	if err := r.syncFile(context.Background(), file, "test-agent"); err != nil {
 		t.Fatalf("second syncFile returned error: %v", err)
 	}
 
@@ -160,7 +162,7 @@ func TestRunnerSyncFileChecksumError(t *testing.T) {
 		logFile: logFile,
 	}
 
-	err = r.syncFile(FileConfig{Path: "artifact.txt", URL: server.URL + "/artifact.txt"}, "test-agent")
+	err = r.syncFile(context.Background(), FileConfig{Path: "artifact.txt", URL: server.URL + "/artifact.txt"}, "test-agent")
 	if err == nil {
 		t.Fatal("expected checksum parsing error")
 	}
@@ -179,16 +181,156 @@ func TestLoadConfigValidation(t *testing.T) {
 	}
 }
 
+func TestParseChecksum_StandardFormat(t *testing.T) {
+	hashText := strings.Repeat("c", 64)
+	// Standard sha256sum output: "<hash>  filename" or "<hash> *filename"
+	for _, input := range []string{
+		hashText + "  file.txt",
+		hashText + " *file.txt",
+		hashText + "  path/to/file",
+	} {
+		hash, err := parseChecksum([]byte(input))
+		if err != nil {
+			t.Fatalf("parseChecksum(%q) returned error: %v", input, err)
+		}
+		if hash != hashText {
+			t.Fatalf("parseChecksum(%q) = %q, want %q", input, hash, hashText)
+		}
+	}
+}
+
+func TestParseChecksum_Empty(t *testing.T) {
+	_, err := parseChecksum([]byte(""))
+	if err == nil {
+		t.Fatal("expected empty checksum to fail")
+	}
+}
+
+func TestParseChecksum_NonHex(t *testing.T) {
+	_, err := parseChecksum([]byte(strings.Repeat("g", 64)))
+	if err == nil {
+		t.Fatal("expected non-hex checksum to fail")
+	}
+}
+
+func TestResolveTargetPath_Dot(t *testing.T) {
+	_, err := resolveTargetPath("/tmp", ".")
+	if err == nil {
+		t.Fatal("expected '.' path to fail")
+	}
+}
+
+func TestResolveTargetPath_Absolute(t *testing.T) {
+	_, err := resolveTargetPath("/tmp", "/etc/passwd")
+	if err == nil {
+		t.Fatal("expected absolute path to fail")
+	}
+}
+
+func TestLoadConfig_Success(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, configFileName)
+	yamlContent := "files:\n  - path: data/file.txt\n    url: https://example.com/file.txt\n"
+	if err := os.WriteFile(configPath, []byte(yamlContent), 0o644); err != nil {
+		t.Fatalf("WriteFile returned error: %v", err)
+	}
+
+	cfg, err := loadConfig(configPath)
+	if err != nil {
+		t.Fatalf("loadConfig returned error: %v", err)
+	}
+	if len(cfg.Files) != 1 {
+		t.Fatalf("expected 1 file, got %d", len(cfg.Files))
+	}
+}
+
+func TestLoadConfig_EmptyFiles(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, configFileName)
+	if err := os.WriteFile(configPath, []byte("files: []\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile returned error: %v", err)
+	}
+
+	_, err := loadConfig(configPath)
+	if err == nil {
+		t.Fatal("expected empty files to fail")
+	}
+}
+
+func TestLoadConfig_InvalidYAML(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, configFileName)
+	if err := os.WriteFile(configPath, []byte("{{{broken\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile returned error: %v", err)
+	}
+
+	_, err := loadConfig(configPath)
+	if err == nil {
+		t.Fatal("expected invalid YAML to fail")
+	}
+}
+
+func TestRunnerSyncFile_Non200Status(t *testing.T) {
+	root := t.TempDir()
+	// Server returns 404 for checksum file (no .sha256 endpoint)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.NotFound(w, r)
+	}))
+	defer server.Close()
+
+	logFile, _ := os.OpenFile(filepath.Join(root, logFileName), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+	defer logFile.Close()
+
+	r := runner{
+		rootDir: root,
+		client:  server.Client(),
+		logFile: logFile,
+	}
+
+	err := r.syncFile(context.Background(), FileConfig{Path: "f.txt", URL: server.URL + "/f.txt"}, "test-agent")
+	if err == nil {
+		t.Fatal("expected error from 404 checksum response")
+	}
+}
+
+func TestRunnerSyncFile_HashMismatch(t *testing.T) {
+	root := t.TempDir()
+	content := []byte("real content")
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/file.txt":
+			_, _ = w.Write(content)
+		case "/file.txt.sha256":
+			// Return a hash that doesn't match content
+			_, _ = w.Write([]byte(strings.Repeat("d", 64)))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	logFile, _ := os.OpenFile(filepath.Join(root, logFileName), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+	defer logFile.Close()
+
+	r := runner{
+		rootDir: root,
+		client:  server.Client(),
+		logFile: logFile,
+	}
+
+	err := r.syncFile(context.Background(), FileConfig{Path: "file.txt", URL: server.URL + "/file.txt"}, "test-agent")
+	if err == nil {
+		t.Fatal("expected hash mismatch error")
+	}
+}
+
 func TestFileSHA256NotExist(t *testing.T) {
 	_, err := fileSHA256(filepath.Join(t.TempDir(), "missing.txt"))
 	if err == nil {
 		t.Fatal("expected missing file error")
 	}
-	if !os.IsNotExist(err) && !errorsIs(err, fs.ErrNotExist) {
-		t.Fatalf("expected not exist error, got %v", err)
+	if !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("expected fs.ErrNotExist, got %v", err)
 	}
-}
-
-func errorsIs(err, target error) bool {
-	return err != nil && target != nil && os.IsNotExist(err)
 }
