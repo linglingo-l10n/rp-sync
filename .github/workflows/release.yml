@@ -1,0 +1,52 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        goos: [linux, darwin, windows]
+        goarch: [amd64, arm64]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+
+      - name: Build
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          ext=""
+          [ "$GOOS" = "windows" ] && ext=".exe"
+          go build -o "rp-sync-${GOOS}-${GOARCH}${ext}" .
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rp-sync-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: rp-sync-*
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Generate checksums
+        working-directory: artifacts
+        run: sha256sum rp-sync-* > checksums.txt
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/*
+          generate_release_notes: true
